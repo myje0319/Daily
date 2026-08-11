@@ -1,13 +1,20 @@
 name: Update gist
+
 on:
+  workflow_dispatch:
+
   push:
     branches:
       - master
+
   schedule:
-    - cron: "0 0 * * *"
+    - cron: "17 9 * * *"
+      timezone: "Asia/Seoul"
+
 jobs:
   update-gist:
     runs-on: ubuntu-latest
+
     steps:
       - name: Update gist
         uses: maxam2017/productive-box@master

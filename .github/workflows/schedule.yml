@@ -1,73 +1,320 @@
-// 2. 과거 모든 contribution year에서 저장소 수집
-const yearsResponse = await github.graphql(`
-  query($login: String!) {
-    user(login: $login) {
-      contributionsCollection {
-        contributionYears
-      }
-    }
-  }
-`, {
-  login: username
-});
+name: Update gist
 
-const years =
-  yearsResponse.user.contributionsCollection.contributionYears;
+on:
+  workflow_dispatch:
 
-core.info(`Contribution years: ${years.join(", ")}`);
+  push:
+    branches:
+      - master
 
-const repoMap = new Map();
+  schedule:
+    - cron: "17 9 * * *"
+      timezone: "Asia/Seoul"
 
-for (const year of years) {
-  const from = `${year}-01-01T00:00:00Z`;
-  const to = `${year}-12-31T23:59:59Z`;
+jobs:
+  update-gist:
+    runs-on: ubuntu-latest
 
-  const result = await github.graphql(`
-    query(
-      $login: String!
-      $from: DateTime!
-      $to: DateTime!
-    ) {
-      user(login: $login) {
-        contributionsCollection(
-          from: $from
-          to: $to
-        ) {
-          commitContributionsByRepository(
-            maxRepositories: 100
-          ) {
-            repository {
-              name
-              nameWithOwner
-              isFork
-              owner {
-                login
+    steps:
+      - name: Update gist from full commit history
+        uses: actions/github-script@v9
+        env:
+          GIST_ID: ${{ secrets.GIST_ID }}
+          TIMEZONE: Asia/Seoul
+
+        with:
+          github-token: ${{ secrets.GH_TOKEN }}
+
+          script: |
+            const gistId = process.env.GIST_ID;
+            const timeZone = process.env.TIMEZONE;
+
+            // 1. 현재 사용자 확인
+            const viewer = await github.graphql(`
+              query {
+                viewer {
+                  login
+                  id
+                }
+              }
+            `);
+
+            const username = viewer.viewer.login;
+            const userId = viewer.viewer.id;
+
+            core.info(`User: ${username}`);
+
+            // 2. 과거 contribution 연도 확인
+            const yearsResponse = await github.graphql(`
+              query($login: String!) {
+                user(login: $login) {
+                  contributionsCollection {
+                    contributionYears
+                  }
+                }
+              }
+            `, {
+              login: username
+            });
+
+            const years =
+              yearsResponse.user.contributionsCollection.contributionYears;
+
+            core.info(`Contribution years: ${years.join(", ")}`);
+
+            // 3. 각 연도의 기여 저장소 수집
+            const repoMap = new Map();
+
+            for (const year of years) {
+              const from = `${year}-01-01T00:00:00Z`;
+              const to = `${year}-12-31T23:59:59Z`;
+
+              try {
+                const result = await github.graphql(`
+                  query(
+                    $login: String!
+                    $from: DateTime!
+                    $to: DateTime!
+                  ) {
+                    user(login: $login) {
+                      contributionsCollection(
+                        from: $from
+                        to: $to
+                      ) {
+                        commitContributionsByRepository(
+                          maxRepositories: 100
+                        ) {
+                          repository {
+                            name
+                            nameWithOwner
+                            isFork
+                            owner {
+                              login
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                `, {
+                  login: username,
+                  from,
+                  to
+                });
+
+                const items =
+                  result.user
+                    .contributionsCollection
+                    .commitContributionsByRepository;
+
+                for (const item of items) {
+                  const repo = item.repository;
+
+                  if (repo && !repo.isFork) {
+                    repoMap.set(repo.nameWithOwner, repo);
+                  }
+                }
+
+              } catch (error) {
+                core.warning(
+                  `Unable to read contributions for ${year}: ${error.message}`
+                );
               }
             }
-          }
-        }
-      }
-    }
-  `, {
-    login: username,
-    from,
-    to
-  });
 
-  const items =
-    result.user
-      .contributionsCollection
-      .commitContributionsByRepository;
+            const repos = [...repoMap.values()];
 
-  for (const item of items) {
-    const repo = item.repository;
+            core.info(
+              `Historical repositories found: ${repos.length}`
+            );
 
-    if (!repo.isFork) {
-      repoMap.set(repo.nameWithOwner, repo);
-    }
-  }
-}
+            // 4. 저장소별 내 커밋 기록 전체 조회
+            const committedDates = [];
 
-const repos = [...repoMap.values()];
+            for (const repo of repos) {
+              let commitCursor = null;
 
-core.info(`Historical repositories found: ${repos.length}`);
+              do {
+                try {
+                  const result = await github.graphql(`
+                    query(
+                      $owner: String!
+                      $name: String!
+                      $userId: ID!
+                      $after: String
+                    ) {
+                      repository(
+                        owner: $owner
+                        name: $name
+                      ) {
+                        defaultBranchRef {
+                          target {
+                            ... on Commit {
+                              history(
+                                first: 100
+                                after: $after
+                                author: { id: $userId }
+                              ) {
+                                nodes {
+                                  committedDate
+                                }
+                                pageInfo {
+                                  hasNextPage
+                                  endCursor
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  `, {
+                    owner: repo.owner.login,
+                    name: repo.name,
+                    userId,
+                    after: commitCursor
+                  });
+
+                  const history =
+                    result.repository
+                      ?.defaultBranchRef
+                      ?.target
+                      ?.history;
+
+                  if (!history) {
+                    break;
+                  }
+
+                  for (const commit of history.nodes) {
+                    committedDates.push(commit.committedDate);
+                  }
+
+                  commitCursor =
+                    history.pageInfo.hasNextPage
+                      ? history.pageInfo.endCursor
+                      : null;
+
+                } catch (error) {
+                  core.warning(
+                    `Skipping ${repo.nameWithOwner}: ${error.message}`
+                  );
+
+                  break;
+                }
+
+              } while (commitCursor);
+            }
+
+            core.info(
+              `Total commits found: ${committedDates.length}`
+            );
+
+            if (committedDates.length === 0) {
+              core.setFailed("No commits found.");
+              return;
+            }
+
+            // 5. 시간대별 집계
+            let morning = 0;
+            let daytime = 0;
+            let evening = 0;
+            let night = 0;
+
+            const hourFormatter =
+              new Intl.DateTimeFormat("en-GB", {
+                timeZone,
+                hour: "2-digit",
+                hourCycle: "h23"
+              });
+
+            for (const date of committedDates) {
+              const hour = Number(
+                hourFormatter.format(new Date(date))
+              );
+
+              if (hour >= 6 && hour < 12) {
+                morning++;
+              } else if (hour >= 12 && hour < 18) {
+                daytime++;
+              } else if (hour >= 18 && hour < 24) {
+                evening++;
+              } else {
+                night++;
+              }
+            }
+
+            const total =
+              morning + daytime + evening + night;
+
+            // 6. 그래프 생성
+            function generateBar(percent, size = 21) {
+              const syms = "░▏▎▍▌▋▊▉█";
+
+              const frac = Math.floor(
+                (size * 8 * percent) / 100
+              );
+
+              const full = Math.floor(frac / 8);
+
+              if (full >= size) {
+                return "█".repeat(size);
+              }
+
+              const semi = frac % 8;
+
+              return (
+                "█".repeat(full) +
+                syms.substring(semi, semi + 1)
+              ).padEnd(size, "░");
+            }
+
+            const periods = [
+              ["🌞 Morning", morning],
+              ["🌆 Daytime", daytime],
+              ["🌃 Evening", evening],
+              ["🌙 Night", night]
+            ];
+
+            const lines =
+              periods.map(([label, commits]) => {
+                const percent =
+                  (commits / total) * 100;
+
+                return [
+                  label.padEnd(10),
+                  `${String(commits).padStart(5)} commits`
+                    .padEnd(14),
+                  generateBar(percent),
+                  `${percent.toFixed(1).padStart(5)}%`
+                ].join(" ");
+              });
+
+            // 7. Gist 읽기
+            const gist =
+              await github.rest.gists.get({
+                gist_id: gistId
+              });
+
+            const oldFilename =
+              Object.keys(gist.data.files)[0];
+
+            const newFilename =
+              morning + daytime > evening + night
+                ? "I'm an early 🐤"
+                : "I'm a night 🦉";
+
+            // 8. Gist 업데이트
+            await github.rest.gists.update({
+              gist_id: gistId,
+
+              files: {
+                [oldFilename]: {
+                  filename: newFilename,
+                  content: lines.join("\n")
+                }
+              }
+            });
+
+            core.info(
+              `Gist updated with ${total} historical commits 🎉`
+            );

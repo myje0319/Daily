@@ -16,7 +16,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Update gist from full commit history
+      - name: Update gist
         uses: actions/github-script@v9
         env:
           GIST_ID: ${{ secrets.GIST_ID }}
@@ -24,28 +24,44 @@ jobs:
 
         with:
           github-token: ${{ secrets.GH_TOKEN }}
+          retries: 3
 
           script: |
             const gistId = process.env.GIST_ID;
             const timeZone = process.env.TIMEZONE;
 
-            // 1. 현재 사용자 확인
-            const viewer = await github.graphql(`
-              query {
-                viewer {
-                  login
-                  id
-                }
-              }
-            `);
-
-            const username = viewer.viewer.login;
-            const userId = viewer.viewer.id;
+            const me = await github.rest.users.getAuthenticated();
+            const username = me.data.login;
 
             core.info(`User: ${username}`);
 
-            // 2. 과거 contribution 연도 확인
-            const yearsResponse = await github.graphql(`
+            const repoMap = new Map();
+
+            // 1. 내가 소유한 저장소 전부 수집
+            // fork 포함
+            const ownedRepos = await github.paginate(
+              github.rest.repos.listForAuthenticatedUser,
+              {
+                affiliation: "owner",
+                visibility: "all",
+                per_page: 100
+              }
+            );
+
+            for (const repo of ownedRepos) {
+              repoMap.set(repo.full_name, {
+                owner: repo.owner.login,
+                name: repo.name,
+                fullName: repo.full_name
+              });
+            }
+
+            core.info(
+              `Owned repositories: ${ownedRepos.length}`
+            );
+
+            // 2. 과거에 기여했던 외부 저장소도 추가
+            const yearsResult = await github.graphql(`
               query($login: String!) {
                 user(login: $login) {
                   contributionsCollection {
@@ -58,12 +74,13 @@ jobs:
             });
 
             const years =
-              yearsResponse.user.contributionsCollection.contributionYears;
+              yearsResult.user
+                .contributionsCollection
+                .contributionYears;
 
-            core.info(`Contribution years: ${years.join(", ")}`);
-
-            // 3. 각 연도의 기여 저장소 수집
-            const repoMap = new Map();
+            core.info(
+              `Contribution years: ${years.join(", ")}`
+            );
 
             for (const year of years) {
               const from = `${year}-01-01T00:00:00Z`;
@@ -87,7 +104,6 @@ jobs:
                           repository {
                             name
                             nameWithOwner
-                            isFork
                             owner {
                               login
                             }
@@ -110,14 +126,18 @@ jobs:
                 for (const item of items) {
                   const repo = item.repository;
 
-                  if (repo && !repo.isFork) {
-                    repoMap.set(repo.nameWithOwner, repo);
+                  if (repo) {
+                    repoMap.set(repo.nameWithOwner, {
+                      owner: repo.owner.login,
+                      name: repo.name,
+                      fullName: repo.nameWithOwner
+                    });
                   }
                 }
 
               } catch (error) {
                 core.warning(
-                  `Unable to read contributions for ${year}: ${error.message}`
+                  `Contribution lookup ${year}: ${error.message}`
                 );
               }
             }
@@ -125,88 +145,58 @@ jobs:
             const repos = [...repoMap.values()];
 
             core.info(
-              `Historical repositories found: ${repos.length}`
+              `Total repositories to scan: ${repos.length}`
             );
 
-            // 4. 저장소별 내 커밋 기록 전체 조회
-            const committedDates = [];
+            // 3. 실제 내 커밋 조회
+            const commitMap = new Map();
 
             for (const repo of repos) {
-              let commitCursor = null;
+              try {
+                const commits = await github.paginate(
+                  github.rest.repos.listCommits,
+                  {
+                    owner: repo.owner,
+                    repo: repo.name,
+                    author: username,
+                    per_page: 100
+                  }
+                );
 
-              do {
-                try {
-                  const result = await github.graphql(`
-                    query(
-                      $owner: String!
-                      $name: String!
-                      $userId: ID!
-                      $after: String
-                    ) {
-                      repository(
-                        owner: $owner
-                        name: $name
-                      ) {
-                        defaultBranchRef {
-                          target {
-                            ... on Commit {
-                              history(
-                                first: 100
-                                after: $after
-                                author: { id: $userId }
-                              ) {
-                                nodes {
-                                  committedDate
-                                }
-                                pageInfo {
-                                  hasNextPage
-                                  endCursor
-                                }
-                              }
-                            }
-                          }
-                        }
-                      }
-                    }
-                  `, {
-                    owner: repo.owner.login,
-                    name: repo.name,
-                    userId,
-                    after: commitCursor
-                  });
+                let repoCount = 0;
 
-                  const history =
-                    result.repository
-                      ?.defaultBranchRef
-                      ?.target
-                      ?.history;
+                for (const commit of commits) {
+                  const date =
+                    commit.commit.author?.date ??
+                    commit.commit.committer?.date;
 
-                  if (!history) {
-                    break;
+                  if (!date) {
+                    continue;
                   }
 
-                  for (const commit of history.nodes) {
-                    committedDates.push(commit.committedDate);
+                  // 같은 commit SHA 중복 방지
+                  if (!commitMap.has(commit.sha)) {
+                    commitMap.set(commit.sha, date);
+                    repoCount++;
                   }
-
-                  commitCursor =
-                    history.pageInfo.hasNextPage
-                      ? history.pageInfo.endCursor
-                      : null;
-
-                } catch (error) {
-                  core.warning(
-                    `Skipping ${repo.nameWithOwner}: ${error.message}`
-                  );
-
-                  break;
                 }
 
-              } while (commitCursor);
+                core.info(
+                  `${repo.fullName}: ${repoCount} commits`
+                );
+
+              } catch (error) {
+                core.warning(
+                  `Skipping ${repo.fullName}: ${error.message}`
+                );
+              }
             }
 
+            const committedDates =
+              [...commitMap.values()];
+
             core.info(
-              `Total commits found: ${committedDates.length}`
+              `Total unique commits found: ${committedDates.length}`
             );
 
             if (committedDates.length === 0) {
@@ -214,13 +204,13 @@ jobs:
               return;
             }
 
-            // 5. 시간대별 집계
+            // 4. 시간대 계산
             let morning = 0;
             let daytime = 0;
             let evening = 0;
             let night = 0;
 
-            const hourFormatter =
+            const formatter =
               new Intl.DateTimeFormat("en-GB", {
                 timeZone,
                 hour: "2-digit",
@@ -228,9 +218,10 @@ jobs:
               });
 
             for (const date of committedDates) {
-              const hour = Number(
-                hourFormatter.format(new Date(date))
-              );
+              const hour =
+                Number(
+                  formatter.format(new Date(date))
+                );
 
               if (hour >= 6 && hour < 12) {
                 morning++;
@@ -244,17 +235,21 @@ jobs:
             }
 
             const total =
-              morning + daytime + evening + night;
+              morning +
+              daytime +
+              evening +
+              night;
 
-            // 6. 그래프 생성
             function generateBar(percent, size = 21) {
               const syms = "░▏▎▍▌▋▊▉█";
 
-              const frac = Math.floor(
-                (size * 8 * percent) / 100
-              );
+              const frac =
+                Math.floor(
+                  size * 8 * percent / 100
+                );
 
-              const full = Math.floor(frac / 8);
+              const full =
+                Math.floor(frac / 8);
 
               if (full >= size) {
                 return "█".repeat(size);
@@ -278,7 +273,7 @@ jobs:
             const lines =
               periods.map(([label, commits]) => {
                 const percent =
-                  (commits / total) * 100;
+                  commits / total * 100;
 
                 return [
                   label.padEnd(10),
@@ -289,7 +284,7 @@ jobs:
                 ].join(" ");
               });
 
-            // 7. Gist 읽기
+            // 5. Gist 업데이트
             const gist =
               await github.rest.gists.get({
                 gist_id: gistId
@@ -299,11 +294,11 @@ jobs:
               Object.keys(gist.data.files)[0];
 
             const newFilename =
-              morning + daytime > evening + night
+              morning + daytime >
+              evening + night
                 ? "I'm an early 🐤"
                 : "I'm a night 🦉";
 
-            // 8. Gist 업데이트
             await github.rest.gists.update({
               gist_id: gistId,
 
@@ -316,5 +311,5 @@ jobs:
             });
 
             core.info(
-              `Gist updated with ${total} historical commits 🎉`
+              `Gist updated with ${total} commits 🎉`
             );

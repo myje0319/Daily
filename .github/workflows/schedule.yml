@@ -33,7 +33,7 @@ jobs:
             const me = await github.rest.users.getAuthenticated();
             const username = me.data.login;
 
-            core.info(`User: ${username}`);
+            // core.info(`User: ${username}`);
 
             const repoMap = new Map();
 
@@ -56,9 +56,9 @@ jobs:
               });
             }
 
-            core.info(
-              `Owned repositories: ${ownedRepos.length}`
-            );
+            // core.info(
+            //   `Owned repositories: ${ownedRepos.length}`
+            // );
 
             // 2. 과거에 기여했던 외부 저장소도 추가
             const yearsResult = await github.graphql(`
@@ -136,9 +136,8 @@ jobs:
                 }
 
               } catch (error) {
-                core.warning(
-                  `Contribution lookup ${year}: ${error.message}`
-                );
+                  core.setFailed("Repository scan failed.");
+                  return;
               }
             }
 
@@ -163,7 +162,7 @@ jobs:
                   }
                 );
 
-                let repoCount = 0;
+                // let repoCount = 0;
 
                 for (const commit of commits) {
                   const date =
@@ -177,18 +176,17 @@ jobs:
                   // 같은 commit SHA 중복 방지
                   if (!commitMap.has(commit.sha)) {
                     commitMap.set(commit.sha, date);
-                    repoCount++;
+                    // repoCount++;
                   }
                 }
 
-                core.info(
-                  `${repo.fullName}: ${repoCount} commits`
-                );
+                // core.info(
+                //   `${repo.fullName}: ${repoCount} commits`
+                // );
 
               } catch (error) {
-                core.warning(
-                  `Skipping ${repo.fullName}: ${error.message}`
-                );
+                  core.setFailed("Repository commit lookup failed.");
+                  return;
               }
             }
 

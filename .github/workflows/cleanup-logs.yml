@@ -1,0 +1,55 @@
+
+name: Clean old gist logs
+
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: write
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete old workflow logs
+        uses: actions/github-script@v9
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const { owner, repo } = context.repo;
+            const cutoff = "2026-10-26T11:23:17Z";
+
+            const runs = await github.paginate(
+              github.rest.actions.listWorkflowRuns,
+              {
+                owner,
+                repo,
+                workflow_id: "schedule.yml",
+                per_page: 100
+              }
+            );
+
+            let deleted = 0;
+            let alreadyRemoved = 0;
+
+            for (const run of runs) {
+              if (run.created_at >= cutoff) continue;
+
+              try {
+                await github.rest.actions.deleteWorkflowRunLogs({
+                  owner,
+                  repo,
+                  run_id: run.id
+                });
+                deleted++;
+              } catch (error) {
+                if (error.status === 404) {
+                  alreadyRemoved++;
+                  continue;
+                }
+                throw error;
+              }
+            }
+
+            core.info(`Deleted: ${deleted}`);
+            core.info(`Already removed: ${alreadyRemoved}`);
